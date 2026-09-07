@@ -504,15 +504,16 @@ static void audio_capture_task(void *arg) {
       }
     } else {
       rx_empty_cnt = 0;
-      /* 上行声道对齐 (TDM 4 时隙, ES7210), 8k 采集即 8k 直接编码:
-       *   (实测播放时 slot1 幅值飙升至 9k+, 确认物理顺序为 MIC1, MIC3, MIC2, MIC4):
-       *     slot0 = MIC1  (麦克风/人声)     → 左声道
-       *     slot1 = MIC3  (扬声器回采/AEC)  → 右声道
-       *     slot2 = MIC2  (另一路麦克风)    → 丢弃
-       *     slot3 = MIC4  (未接)            → 丢弃
+      /* 上行声道对齐 (ES7210 TDM 4 时隙), 8k 采集即 8k 直接编码:
+       *   (实测 2026-09-07: 播放欢迎语时 slot1 强回采, 说话时 slot2 强信号,
+       *    slot0/slot3 全程静音 → 人声在 MIC2(slot2), 回采在 MIC3(slot1))
+       *     slot0 = MIC1 (实测死寂)        → 丢弃
+       *     slot1 = MIC3 (扬声器回采/AEC)  → 右声道
+       *     slot2 = MIC2 (人声)            → 左声道
+       *     slot3 = MIC4 (未接)            → 丢弃
        *   4-slot 是为了保证 MCLK_256 整数分频 (256/64=4), 让 ES7210 收到
        *   正确的 BCLK/LRCK, RX 才有数据。
-       *   流程: 读 8k TDM → 取 slot0(MIC1)/slot1(MIC3) → planar[L=MIC1][R=MIC3]@8k
+       *   流程: 读 8k TDM → 取 slot2(MIC2)/slot1(MIC3) → planar[L=MIC2][R=MIC3]@8k
        *         → channels=2 A-law 编码 → L+R 一起上行。 */
       size_t tdm_frames = (size_t)received / (4 * sizeof(int16_t)); /* TDM 帧数@8k */
       if (tdm_frames > 0) {
@@ -523,10 +524,38 @@ static void audio_capture_task(void *arg) {
         }
         const int16_t *samples = (const int16_t *)buf;
         int16_t *planar        = (int16_t *)planar_buf;
+        /* 诊断: 原始 TDM 每时隙峰值 (确认 ES7210 是否采到人声, 排查"说话无反应")。
+         * 每 50 帧(~1.5s)打印一次: peak0=MIC1 peak1=MIC3 peak2=MIC2 peak3=MIC4.
+         * 实测(2026-09-07): MIC1(slot0)静音失效, 人声实际落在 MIC2(slot2);
+         * 上行人声通道已切到 slot2, 本日志用于后续验证映射。 */
+        static uint32_t dbg_cnt = 0;
+        static int16_t  dbg_peak[4] = {0, 0, 0, 0};
         for (size_t i = 0; i < tdm_frames; i++) {
-          planar[i]               = samples[i * 4 + 0];   /* slot0 = MIC1 (左) */
-          planar[tdm_frames + i]  = samples[i * 4 + 1];   /* slot1 = MIC3 回采 (右) */
-          /* slot2(MIC2) 与 slot3(MIC4 未接) 丢弃 */
+          int16_t v0 = samples[i * 4 + 0];
+          int16_t v1 = samples[i * 4 + 1];
+          int16_t v2 = samples[i * 4 + 2];
+          int16_t v3 = samples[i * 4 + 3];
+          if (v0 < 0) v0 = (int16_t)-v0;
+          if (v1 < 0) v1 = (int16_t)-v1;
+          if (v2 < 0) v2 = (int16_t)-v2;
+          if (v3 < 0) v3 = (int16_t)-v3;
+          if (v0 > dbg_peak[0]) dbg_peak[0] = v0;
+          if (v1 > dbg_peak[1]) dbg_peak[1] = v1;
+          if (v2 > dbg_peak[2]) dbg_peak[2] = v2;
+          if (v3 > dbg_peak[3]) dbg_peak[3] = v3;
+        }
+        if (++dbg_cnt >= 50) {
+          dbg_cnt = 0;
+          ESP_LOGD(TAG, "mic diag: peak slot0(MIC1)=%d slot1(MIC3)=%d "
+                   "slot2(MIC2)=%d slot3(MIC4)=%d (0=silence, 32767=max)",
+                   dbg_peak[0], dbg_peak[1], dbg_peak[2], dbg_peak[3]);
+          /* 预期: slot0(MIC1) 死寂(<100), slot1(MIC3)=播放回采, slot2(MIC2)=人声. */
+          dbg_peak[0] = dbg_peak[1] = dbg_peak[2] = dbg_peak[3] = 0;
+        }
+        for (size_t i = 0; i < tdm_frames; i++) {
+          planar[i]               = samples[i * 4 + 2];   /* slot2 = MIC2 (人声, 实测有效) */
+          planar[tdm_frames + i]  = samples[i * 4 + 1];   /* slot1 = MIC3 回采/AEC */
+          /* slot0(MIC1 实测死寂) 与 slot3(MIC4 未接) 丢弃 */
         }
         size_t l8 = tdm_frames, r8 = tdm_frames;   /* 8k 硬件, 1:1 */
         {
@@ -541,7 +570,12 @@ static void audio_capture_task(void *arg) {
           } else {
             /* 音量为左声道 MIC1 的响度指示 (8k 帧数 l8);
              * g711_len = 2*l8, L(MIC1) + R(MIC3 回采) 双声道一起上行。 */
-            ai_chat_ui_update_volume(compute_audio_level(g711_buf, l8));
+            uint8_t lvl = compute_audio_level(g711_buf, l8);
+            if (dbg_cnt == 1) {  /* 每 50 帧顺带打一次 UI 音量值 */
+              ESP_LOGD(TAG, "mic diag: ui_volume=%u (0=静音, 100=满幅)",
+                       (unsigned)lvl);
+            }
+            ai_chat_ui_update_volume(lvl);
             convai_audio_frame_info_t info = {.data_type =
                                                   CONVAI_AUDIO_DATA_TYPE_G711A};
             int rc = convai_send_audio(g_engine, g711_buf, g711_len, &info);
