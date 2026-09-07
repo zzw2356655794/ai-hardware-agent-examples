@@ -108,6 +108,14 @@ static int i2s_init(struct audio_lckfb_s *audio) {
     };
     ESP_ERROR_CHECK(i2s_channel_init_tdm_mode(audio->rx_chan, &tdm_cfg));
 
+    /* 预使能 TX/RX 通道: esp_codec_dev_open() 内部的 set_fmt 会先 disable 再
+     * reconfig 通道。若通道从未 enable 过, IDF v6.0.2 的 i2s_channel_disable()
+     * 会打印 ERROR "the channel has not been enabled yet" 并返回 INVALID_STATE。
+     * 预使能后首次 disable 才能成功, 消除启动阶段的误报, 与 xiaozhi-esp32
+     * 板级驱动保持一致。 */
+    ESP_ERROR_CHECK(i2s_channel_enable(audio->tx_chan));
+    ESP_ERROR_CHECK(i2s_channel_enable(audio->rx_chan));
+
     ESP_LOGI(TAG, "I2S0: TX=std stereo, RX=TDM 4-slot, Fs=%d, %d-bit",
              AUDIO_SAMPLE_RATE, AUDIO_BITS_PER_SAMPLE);
     return 0;
@@ -269,6 +277,10 @@ int audio_lckfb_init(audio_lckfb_t *audio_pub,
     }
     if (esp_codec_dev_init(audio, i2c_bus) != 0) {
         ESP_LOGE(TAG, "esp_codec_dev init failed");
+        /* 通道已被 i2s_init() 预使能, 删除前必须先 disable,
+         * 否则 i2s_del_channel 会因通道处于 RUNNING 状态而失败。 */
+        i2s_channel_disable(audio->tx_chan);
+        i2s_channel_disable(audio->rx_chan);
         i2s_del_channel(audio->tx_chan);
         i2s_del_channel(audio->rx_chan);
         return -1;
